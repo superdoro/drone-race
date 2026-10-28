@@ -37,10 +37,17 @@ class SimBackend(ABC):
         self.dt = dt
 
     @abstractmethod
-    def build(self, num_envs: int, obstacle_radii: list[float], obstacle_height: float) -> None:
-        """Create the scene: ground, one drone per env and one vertical cylinder per obstacle slot.
+    def build(
+        self,
+        num_envs: int,
+        obstacle_radii: list[float],
+        obstacle_height: float,
+        wall_sizes: list[tuple[float, float, float]],
+    ) -> None:
+        """Create the scene: ground, one drone per env, one vertical cylinder per obstacle slot and wall boxes.
 
-        Obstacle radii are fixed per slot at build time; the task decides per env where each slot goes.
+        Obstacle radii and wall box sizes (local x, local y, height) are fixed at build time; the task decides per
+        env where each obstacle and wall goes.
         """
 
     @abstractmethod
@@ -50,6 +57,10 @@ class SimBackend(ABC):
     @abstractmethod
     def set_obstacles(self, env_ids: torch.Tensor, xy: torch.Tensor, active: torch.Tensor) -> None:
         """Place obstacle slots of `env_ids` at `xy` (n, K, 2); inactive slots (n, K) must be hidden from sensors."""
+
+    @abstractmethod
+    def set_walls(self, env_ids: torch.Tensor, centers: torch.Tensor, yaw: torch.Tensor) -> None:
+        """Place wall boxes of `env_ids`: xy centers (n, num_walls, 2), all rotated by `yaw` (n,) about z, on the ground."""
 
     @abstractmethod
     def apply_rotor_thrusts(self, thrusts: torch.Tensor) -> None:
@@ -72,7 +83,7 @@ class SimBackend(ABC):
     def set_goal_markers(self, env_ids: torch.Tensor, pos: torch.Tensor) -> None:
         pass
 
-    def follow_camera(self, env_idx: int, target_pos: torch.Tensor) -> None:
+    def follow_camera(self, env_idx: int, target_pos: torch.Tensor, forward_xy: torch.Tensor) -> None:
         pass
 
     def start_recording(self, path: str, fps: int) -> None:

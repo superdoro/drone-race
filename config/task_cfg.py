@@ -10,17 +10,24 @@ def get_cfgs() -> tuple[dict, dict]:
         "arena": {
             "spawn_z": (1.0, 2.0),  # start and goal altitude range
             "ground_z": 0.1,  # below this counts as a crash into the ground
-            "ceiling_z": 3.5,  # below the obstacle tops, so obstacles must be passed around, not over
-            "horizontal_margin": 3.0,  # allowed detour beyond the start-goal circle before out-of-bounds
+            "ceiling_z": 3.5,  # below the obstacle and wall tops, so they must be passed around, not over
+        },
+        # Closed corridor around the start->goal segment; touching a wall is a crash, so the pillars inside cannot
+        # be bypassed by flying around the whole cluster.
+        "corridor": {
+            "half_width": 1.5,
+            "back_margin": 1.0,  # end wall behind the start
+            "front_margin": 1.5,  # end wall beyond the goal
+            "wall_thickness": 0.1,
+            "height": 4.0,
         },
         "goal": {"reach_radius": 0.3},
         "init": {"max_tilt_deg": 10.0},
         "obstacles": {
             "radius_range": (0.1, 0.3),
             "height": 4.0,
-            "along_range": (0.15, 0.85),  # fraction of the start->goal segment where obstacles are scattered
-            "lateral_spread": 1.5,  # max sideways offset from the segment
-            "endpoint_clearance": 0.6,  # min gap between an obstacle surface and the start / goal
+            "endpoint_clearance": 0.6,  # min gap between an obstacle surface and the start / goal (along the corridor)
+            "min_spacing": 0.8,  # min row length per pillar along the corridor, caps the count on short corridors
         },
         "control": {
             "max_body_rates": (8.0, 8.0, 3.0),  # roll, pitch, yaw rate at |action| = 1
@@ -28,8 +35,8 @@ def get_cfgs() -> tuple[dict, dict]:
         },
         "obs": {
             "mode": "state",  # "state": obstacle positions are known; "depth": reserved for the camera stage
-            "num_sensed_obstacles": 4,
-            "sense_range": 4.0,
+            "num_sensed_obstacles": 8,  # 4 was too few in dense rows: half of them were pillars already passed
+            "sense_range": 8.0,  # at 4 m a pillar showed up only ~0.4 s before a head-on hit at 9 m/s
             "goal_dist_clip": 10.0,
             "lin_vel_scale": 5.0,
             "ang_vel_scale": 10.0,
@@ -43,7 +50,7 @@ def get_cfgs() -> tuple[dict, dict]:
             "action_bound": 1.0,
             "proximity": 0.5,
             "proximity_margin": 0.3,
-            "crash": 20.0,
+            "crash": 40.0,
             "goal": 10.0,
         },
         "curriculum": {

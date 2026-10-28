@@ -4,6 +4,7 @@ import math
 
 import torch
 
+from task.corridor import left_normal
 from utils.math_utils import quat_from_euler
 
 
@@ -39,28 +40,33 @@ def sample_num_obstacles(n: int, level: dict, device) -> torch.Tensor:
 
 
 def sample_obstacles(start: torch.Tensor, goal: torch.Tensor, radii: torch.Tensor, num_active: torch.Tensor, cfg: dict):
-    """Scatter `num_active` (n,) cylinders around the start->goal segment so the straight line is likely blocked.
+    """Fill the corridor with up to `num_active` (n,) cylinders, one per longitudinal row.
 
-    Slots beyond `num_active`, or too close to the start or the goal, are deactivated.
+    The free length between start and goal is split into equal rows of at least `min_spacing` (the count is capped
+    to fit), so pillars never pile up into an impassable wall. Laterally a pillar can sit anywhere across the
+    corridor, up to touching a side wall, so hugging a wall is not a safe way around them.
     Returns xy (n, K, 2) and active (n, K).
     """
-    ocfg = cfg["obstacles"]
+    ocfg, half_width = cfg["obstacles"], cfg["corridor"]["half_width"]
     n, num_slots = start.shape[0], radii.shape[0]
     device = start.device
 
     seg = goal[:, :2] - start[:, :2]
-    normal = torch.stack([-seg[:, 1], seg[:, 0]], dim=-1) / seg.norm(dim=-1, keepdim=True).clamp_min(1e-6)
-    t = ocfg["along_range"][0] + (ocfg["along_range"][1] - ocfg["along_range"][0]) * torch.rand(
-        n, num_slots, device=device
-    )
-    lateral = ocfg["lateral_spread"] * (2.0 * torch.rand(n, num_slots, device=device) - 1.0)
-    xy = start[:, None, :2] + t[..., None] * seg[:, None] + lateral[..., None] * normal[:, None]
+    length = seg.norm(dim=-1)
+    direction = seg / length.clamp_min(1e-6)[:, None]
+    margin = ocfg["endpoint_clearance"] + (radii.max() if num_slots > 0 else 0.0)
+    span = (length - 2.0 * margin).clamp_min(0.0)
+    num_active = torch.minimum(num_active, torch.floor(span / ocfg["min_spacing"]).long())
+    active = torch.arange(num_slots, device=device)[None] < num_active[:, None]
 
-    clearance = radii[None] + ocfg["endpoint_clearance"]
-    far_from_start = (xy - start[:, None, :2]).norm(dim=-1) > clearance
-    far_from_goal = (xy - goal[:, None, :2]).norm(dim=-1) > clearance
-    in_budget = torch.arange(num_slots, device=device)[None] < num_active[:, None]
-    return xy, in_budget & far_from_start & far_from_goal
+    # Random row order per env, so slot radii do not always appear at the same place along the corridor.
+    keys = torch.where(active, torch.rand(n, num_slots, device=device), 2.0)
+    row = keys.argsort(dim=1).argsort(dim=1).float()
+    spacing = span / num_active.clamp_min(1)
+    x = margin + (row + 0.2 + 0.6 * torch.rand(n, num_slots, device=device)) * spacing[:, None]
+    y = (half_width - radii)[None] * (2.0 * torch.rand(n, num_slots, device=device) - 1.0)
+    xy = start[:, None, :2] + x[..., None] * direction[:, None] + y[..., None] * left_normal(direction)[:, None]
+    return xy, active
 
 
 class Curriculum:
@@ -81,6 +87,10 @@ class Curriculum:
     @property
     def max_obstacles(self) -> int:
         return max(level["num_obstacles"][1] for level in self.levels)
+
+    @property
+    def max_goal_dist(self) -> float:
+        return max(level["goal_dist"][1] for level in self.levels)
 
     def update(self, success: torch.Tensor) -> bool:
         """Feed the success flags of the episodes that just ended; return True when the level changed."""

@@ -1,4 +1,4 @@
-"""Sanity checks for the task + backend: shapes / NaNs, hover, collision detection and frame conventions.
+"""Sanity checks for the task + backend: shapes / NaNs, hover, rate tracking, pillar layout and collisions.
 
 Usage: python check_env.py [--backend genesis] [--num_envs 64]
 """
@@ -11,6 +11,7 @@ import torch
 from backends.base import make_backend
 from config.drone_params import DRONES
 from config.task_cfg import get_cfgs
+from task.corridor import left_normal, to_corridor_frame
 from task.goal_nav_task import GoalNavTask
 
 
@@ -71,6 +72,25 @@ def main():
     _, rew, dones, extras = task.step(torch.zeros(n, 4, device=task.device))
     print(f"[4] obstacle overlap -> done {dones.float().mean():.2f}, crash rate {extras['log']['Metrics/crash_obstacle'].mean():.2f}")
     assert dones.all() and (extras["log"]["Metrics/crash_obstacle"] == 1).all()
+
+    # 5) Every active pillar lies inside the corridor, between start and goal.
+    task.reset()
+    x, y = to_corridor_frame(task.obs_xy, task.start[:, None, :2], task.corridor_dir[:, None])
+    act = task.obs_active
+    half_width = cfg["corridor"]["half_width"]
+    inside = (y.abs() <= half_width - task.obstacle_radii[None] + 1e-4) & (x > 0) & (x < task.corridor_len[:, None])
+    print(f"[5] {act.sum(dim=1).float().mean():.1f} pillars per env on average, all inside the corridor: {bool(inside[act].all())}")
+    assert inside[act].all()
+
+    # 6) A drone touching a side wall must end the episode with a wall crash.
+    task.obs_active[:] = False
+    ids = torch.arange(n, device=task.device)
+    near_wall = task.start[:, :2] + task.corridor_dir + left_normal(task.corridor_dir) * (half_width - 0.03)
+    pos = torch.cat([near_wall, task.start[:, 2:]], dim=-1)
+    task.backend.reset_drones(ids, pos, torch.tensor([[1.0, 0.0, 0.0, 0.0]], device=task.device).expand(n, -1))
+    _, _, dones, extras = task.step(torch.zeros(n, 4, device=task.device))
+    print(f"[6] touching the side wall -> done {dones.float().mean():.2f}, wall crash rate {extras['log']['Metrics/crash_wall'].mean():.2f}")
+    assert dones.all() and (extras["log"]["Metrics/crash_wall"] == 1).all()
 
     print("All checks passed.")
 

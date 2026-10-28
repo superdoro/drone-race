@@ -30,9 +30,10 @@ class GenesisBackend(SimBackend):
         self.rendered_env = rendered_env
         self.camera = None
 
-    def build(self, num_envs: int, obstacle_radii: list[float], obstacle_height: float) -> None:
+    def build(self, num_envs, obstacle_radii, obstacle_height, wall_sizes) -> None:
         self.num_envs = num_envs
         self.obstacle_height = obstacle_height
+        self.wall_height = max(size[2] for size in wall_sizes) if wall_sizes else 0.0
         self.scene = gs.Scene(
             sim_options=gs.options.SimOptions(dt=self.dt, substeps=1),
             rigid_options=gs.options.RigidOptions(enable_collision=False, enable_joint_limit=False),
@@ -58,6 +59,13 @@ class GenesisBackend(SimBackend):
             )
             for r in obstacle_radii
         ]
+        self.walls = [
+            self.scene.add_entity(
+                gs.morphs.Box(size=size, pos=(0.0, 0.0, _HIDDEN_Z), fixed=True, collision=False, batch_fixed_verts=True),
+                surface=gs.surfaces.Default(color=(0.6, 0.62, 0.68)),
+            )
+            for size in wall_sizes
+        ]
         self.goal_marker = self.scene.add_entity(
             gs.morphs.Sphere(radius=0.15, pos=(0.0, 0.0, _HIDDEN_Z), fixed=True, collision=False),
             surface=gs.surfaces.Default(color=(0.1, 0.8, 0.2)),
@@ -67,7 +75,6 @@ class GenesisBackend(SimBackend):
         self.scene.build(n_envs=num_envs)
 
         self._kf = self.drone.kf
-        self._parked = torch.tensor([0.0, 0.0, _HIDDEN_Z], device=self.device)
 
     def reset_drones(self, env_ids, pos, quat):
         self.drone_entity.set_pos(pos, envs_idx=env_ids, zero_velocity=True)
@@ -78,6 +85,15 @@ class GenesisBackend(SimBackend):
         pos = torch.cat([xy, z[..., None]], dim=-1)
         for k, entity in enumerate(self.obstacles):
             entity.set_pos(pos[:, k], envs_idx=env_ids)
+
+    def set_walls(self, env_ids, centers, yaw):
+        z = torch.full_like(centers[..., :1], self.wall_height / 2)
+        pos = torch.cat([centers, z], dim=-1)
+        zeros = torch.zeros_like(yaw)
+        quat = torch.stack([torch.cos(yaw / 2), zeros, zeros, torch.sin(yaw / 2)], dim=-1)
+        for k, entity in enumerate(self.walls):
+            entity.set_pos(pos[:, k], envs_idx=env_ids)
+            entity.set_quat(quat, envs_idx=env_ids)
 
     def apply_rotor_thrusts(self, thrusts):
         self.drone_entity.set_propellers_rpm(torch.sqrt(thrusts.clamp_min(0.0) / self._kf))
@@ -99,11 +115,15 @@ class GenesisBackend(SimBackend):
     def set_goal_markers(self, env_ids, pos):
         self.goal_marker.set_pos(pos, envs_idx=env_ids)
 
-    def follow_camera(self, env_idx, target_pos):
+    def follow_camera(self, env_idx, target_pos, forward_xy):
         if self.camera is not None:
             target = target_pos.detach().cpu().numpy()
+            forward = torch.cat([forward_xy, forward_xy.new_zeros(1)]).detach().cpu().numpy()
+            # High chase view from behind along the corridor, so the walls never block it.
             # Pass `up` every time: Genesis otherwise reuses the previous frame's tilted up vector and the view rolls.
-            self.camera.set_pose(pos=target + [-1.0, -1.0, 2.5], lookat=target, up=(0.0, 0.0, 1.0))
+            self.camera.set_pose(
+                pos=target - 1.2 * forward + [0.0, 0.0, 2.8], lookat=target + 1.0 * forward, up=(0.0, 0.0, 1.0)
+            )
 
     def start_recording(self, path, fps):
         if self.camera is None:

@@ -4,6 +4,7 @@ import torch
 
 from backends.base import DroneState
 from task.collision import nearest_obstacles
+from task.corridor import NUM_WALLS, wall_distances, wall_normals
 from utils.math_utils import quat_rotate_inverse
 
 
@@ -43,6 +44,23 @@ def obstacle_obs(state: DroneState, obs_xy, radii, active, cfg: dict) -> torch.T
         rel[:, :kk, :2] = centers - state.pos[:, None, :2]
         rel[:, :kk] = quat_rotate_inverse(state.quat[:, None].expand(-1, kk, -1), rel[:, :kk])
         dist[:, :kk] = surface
+    return _encode_sensed(rel, dist, sense_range)
+
+
+def wall_obs(state: DroneState, origin, direction, length, cfg: dict) -> torch.Tensor:
+    """Body-frame vector to the closest point of each corridor wall plus its distance. Dim 4 * 4.
+
+    Same encoding as `obstacle_obs`: walls beyond the sensing range read as zero offset and distance 1.
+    """
+    dist = wall_distances(state.pos, origin, direction, length, cfg)
+    normals = wall_normals(direction)
+    rel = torch.zeros(*dist.shape, 3, device=dist.device)
+    rel[..., :2] = normals * dist[..., None]
+    rel = quat_rotate_inverse(state.quat[:, None].expand(-1, NUM_WALLS, -1), rel)
+    return _encode_sensed(rel, dist, cfg["obs"]["sense_range"])
+
+
+def _encode_sensed(rel: torch.Tensor, dist: torch.Tensor, sense_range: float) -> torch.Tensor:
     sensed = dist < sense_range
     rel = torch.where(sensed[..., None], rel / sense_range, 0.0)
     dist = torch.where(sensed, dist, sense_range) / sense_range

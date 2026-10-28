@@ -94,7 +94,7 @@ def main():
                 if key.startswith("Metrics/"):
                     metrics.setdefault(key, []).append(value.flatten())
             if args.record or args.viewer:
-                backend.follow_camera(0, backend.get_drone_state().pos[0])
+                backend.follow_camera(0, backend.get_drone_state().pos[0], env.corridor_dir[0])
             if args.record and step == record_steps:
                 backend.stop_recording()
 
