@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+
+# training outputs: checkpoints, TensorBoard events, videos
+logs/
+*.pt
+*.onnx
+*.mp4
+
+.vscode/
+.idea/
