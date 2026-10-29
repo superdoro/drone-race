@@ -1,16 +1,18 @@
-"""Reward terms for 'reach the goal as fast as possible without hitting anything'."""
+"""Reward terms for 'get through the rooms to the goal without hitting anything, at a moderate speed'."""
 
 import torch
 
 
 def compute_rewards(
-    prev_dist: torch.Tensor,
-    dist: torch.Tensor,
+    prev_remaining: torch.Tensor,
+    remaining: torch.Tensor,
+    lin_vel: torch.Tensor,
     ang_vel: torch.Tensor,
     raw_actions: torch.Tensor,
     actions: torch.Tensor,
     last_actions: torch.Tensor,
     min_clearance: torch.Tensor,
+    approach_danger: torch.Tensor,
     crashed: torch.Tensor,
     reached: torch.Tensor,
     cfg: dict,
@@ -18,10 +20,13 @@ def compute_rewards(
     rcfg = cfg["rewards"]
     margin = rcfg["proximity_margin"]
     terms = {
-        # meters gained toward the goal this step (same idea as the gate-progress reward of Swift, Nature 2023)
-        "progress": rcfg["progress"] * (prev_dist - dist),
-        # constant cost per step: together with the discount it makes faster arrival strictly better
-        "time": torch.full_like(dist, -rcfg["time"]),
+        # meters gained along the route (through doors and partition gaps), so it never rewards pushing into a wall;
+        # a potential difference, so flying back and forth through a door earns nothing
+        "progress": rcfg["progress"] * (prev_remaining - remaining),
+        # small constant cost per step so that hovering in place is not an option
+        "time": torch.full_like(remaining, -rcfg["time"]),
+        # soft speed limit: being faster than this earns nothing, slowing down leaves time to steer around obstacles
+        "speed_limit": -rcfg["speed_limit"] * (lin_vel.norm(dim=-1) - rcfg["max_speed"]).clamp_min(0.0).square(),
         "ang_vel": -rcfg["ang_vel"] * ang_vel.square().sum(dim=-1),
         # yaw is free in a heading-invariant task, so without this the policy spins continuously
         "yaw_rate": -rcfg["yaw_rate"] * ang_vel[:, 2].square(),
@@ -30,6 +35,9 @@ def compute_rewards(
         "action_bound": -rcfg["action_bound"] * (raw_actions.abs() - 1.0).clamp_min(0.0).square().sum(dim=-1),
         # shaped warning before an actual collision (clearance = gap between the drone body and the closest surface)
         "proximity": -rcfg["proximity"] * ((margin - min_clearance) / margin).clamp(0.0, 1.0),
+        # closing speed toward a nearby pillar / free-standing wall (task/geometry.py: approach_danger); the progress
+        # term pulls straight through these, so without it the only warning is the crash itself
+        "approach": -rcfg["approach"] * approach_danger,
         "crash": -rcfg["crash"] * crashed.float(),
         "goal": rcfg["goal"] * reached.float(),
     }

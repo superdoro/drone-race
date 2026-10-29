@@ -1,66 +1,132 @@
-"""Observation builders, split by source so that the obstacle part can later be replaced by a depth-image encoder."""
+"""Observation builders, split by source so that the obstacle parts can later be replaced by a depth-image encoder."""
 
 import torch
 
 from backends.base import DroneState
-from task.collision import nearest_obstacles
-from task.corridor import NUM_WALLS, wall_distances, wall_normals
+from task.geometry import clip_segments_to_disc, nearest, pillar_surface_distance, segment_closest_points
+from task.route import RouteState
 from utils.math_utils import quat_rotate_inverse
 
 
-def proprio_obs(state: DroneState, goal: torch.Tensor, last_actions: torch.Tensor, cfg: dict) -> torch.Tensor:
-    """Goal direction/distance, velocities and gravity, all in the body frame (heading invariant). Dim 17."""
+def _to_body(quat: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """Rotate world vectors (N, ..., 3) into the body frame of each drone (quat (N, 4))."""
+    return quat_rotate_inverse(quat.view(quat.shape[0], *([1] * (v.dim() - 2)), 4).expand(*v.shape[:-1], 4), v)
+
+
+def _lift(xy: torch.Tensor) -> torch.Tensor:
+    return torch.cat([xy, torch.zeros_like(xy[..., :1])], dim=-1)
+
+
+def proprio_obs(state: DroneState, last_actions: torch.Tensor, cfg: dict) -> torch.Tensor:
+    """Velocities and gravity in the body frame (heading invariant), last action and altitude. Dim 14."""
     ocfg = cfg["obs"]
-    rel_goal = quat_rotate_inverse(state.quat, goal - state.pos)
-    dist = rel_goal.norm(dim=-1, keepdim=True)
-    gravity = torch.tensor([0.0, 0.0, -1.0], device=goal.device).expand_as(rel_goal)
+    gravity = torch.tensor([0.0, 0.0, -1.0], device=state.pos.device).expand_as(state.pos)
     return torch.cat(
         [
-            rel_goal / dist.clamp_min(1e-6),
-            dist.clamp_max(ocfg["goal_dist_clip"]) / ocfg["goal_dist_clip"],
-            quat_rotate_inverse(state.quat, state.lin_vel) / ocfg["lin_vel_scale"],
+            _to_body(state.quat, state.lin_vel) / ocfg["lin_vel_scale"],
             state.ang_vel / ocfg["ang_vel_scale"],
-            quat_rotate_inverse(state.quat, gravity),
+            _to_body(state.quat, gravity),
             last_actions,
+            state.pos[:, 2:3] / cfg["arena"]["ceiling_z"],
         ],
         dim=-1,
     )
 
 
-def obstacle_obs(state: DroneState, obs_xy, radii, active, cfg: dict) -> torch.Tensor:
-    """Body-frame offsets to the k nearest sensed obstacle axes plus surface distances. Dim 4 * k.
+def route_obs(state: DroneState, route: RouteState, cfg: dict) -> torch.Tensor:
+    """The exit of the current room and of the next one, in the body frame. Dim 14.
 
-    Obstacles beyond the sensing range (and padding slots) read as zero offset and normalized distance 1.
+    Only doors are given; the gaps of the partitions inside a room have to be found from the wall observations.
+    """
+    clip = cfg["obs"]["goal_dist_clip"]
+
+    def target(pos):
+        rel = _to_body(state.quat, pos - state.pos)
+        dist = rel.norm(dim=-1, keepdim=True)
+        return rel / dist.clamp_min(1e-6), dist.clamp_max(clip) / clip
+
+    door_dir, door_dist = target(route.door)
+    next_dir, next_dist = target(route.next_door)
+    has_next = route.has_next[:, None].float()
+    return torch.cat(
+        [
+            door_dir,
+            door_dist,
+            _to_body(state.quat, _lift(route.door_normal)),
+            route.door_width[:, None],
+            route.is_goal[:, None].float(),
+            next_dir * has_next,
+            next_dist * has_next,
+            has_next,
+        ],
+        dim=-1,
+    )
+
+
+def pillar_obs(state: DroneState, xy, radii, active, cfg: dict) -> torch.Tensor:
+    """Body-frame offsets to the k nearest pillar axes plus surface distances. Dim 4 * k.
+
+    Pillars beyond the sensing range (and padding slots) read as zero offset and normalized distance 1.
     """
     ocfg = cfg["obs"]
-    k, sense_range = ocfg["num_sensed_obstacles"], ocfg["sense_range"]
+    k, sense_range = ocfg["num_sensed_pillars"], ocfg["sense_range"]
     n = state.pos.shape[0]
     rel = torch.zeros(n, k, 3, device=state.pos.device)
     dist = torch.full((n, k), sense_range, device=state.pos.device)
-    if obs_xy.shape[1] > 0:
-        idx, surface = nearest_obstacles(state.pos, obs_xy, radii, active, k)
+    if xy.shape[1] > 0:
+        idx, surface = nearest(pillar_surface_distance(state.pos, xy, radii, active), k)
         kk = idx.shape[1]
-        centers = torch.gather(obs_xy, 1, idx[..., None].expand(-1, -1, 2))
-        rel[:, :kk, :2] = centers - state.pos[:, None, :2]
-        rel[:, :kk] = quat_rotate_inverse(state.quat[:, None].expand(-1, kk, -1), rel[:, :kk])
+        rel[:, :kk, :2] = torch.gather(xy, 1, idx[..., None].expand(-1, -1, 2)) - state.pos[:, None, :2]
+        rel[:, :kk] = _to_body(state.quat, rel[:, :kk])
         dist[:, :kk] = surface
-    return _encode_sensed(rel, dist, sense_range)
+    return _encode_sensed(rel.flatten(2), dist, sense_range)
 
 
-def wall_obs(state: DroneState, origin, direction, length, cfg: dict) -> torch.Tensor:
-    """Body-frame vector to the closest point of each corridor wall plus its distance. Dim 4 * 4.
+def wall_obs(state: DroneState, segments, active, cfg: dict) -> torch.Tensor:
+    """The k nearest wall segments: body-frame vectors to the closest point and to both ends of the part within the
+    sensing range, plus the distance. Dim 10 * k.
 
-    Same encoding as `obstacle_obs`: walls beyond the sensing range read as zero offset and distance 1.
+    The ends tell where a wall stops, i.e. where the gap of a partition or a door is. They are ordered so that the
+    second is counter-clockwise of the first as seen from the drone, which removes the storage-order ambiguity.
     """
-    dist = wall_distances(state.pos, origin, direction, length, cfg)
-    normals = wall_normals(direction)
-    rel = torch.zeros(*dist.shape, 3, device=dist.device)
-    rel[..., :2] = normals * dist[..., None]
-    rel = quat_rotate_inverse(state.quat[:, None].expand(-1, NUM_WALLS, -1), rel)
-    return _encode_sensed(rel, dist, cfg["obs"]["sense_range"])
+    ocfg = cfg["obs"]
+    k, sense_range = ocfg["num_sensed_walls"], ocfg["sense_range"]
+    n = state.pos.shape[0]
+    closest, dist = segment_closest_points(state.pos, segments, active)
+    idx, dist = nearest(dist, k)
+    kk = idx.shape[1]
+    seg = torch.gather(segments, 1, idx[..., None].expand(-1, -1, 4))
+    end0, end1 = clip_segments_to_disc(state.pos[:, None, :2], seg, sense_range)
+    rel_c = torch.gather(closest, 1, idx[..., None].expand(-1, -1, 2)) - state.pos[:, None, :2]
+    rel_0, rel_1 = end0 - state.pos[:, None, :2], end1 - state.pos[:, None, :2]
+    swap = (rel_0[..., 0] * rel_1[..., 1] - rel_0[..., 1] * rel_1[..., 0] < 0.0)[..., None]
+    rel_0, rel_1 = torch.where(swap, rel_1, rel_0), torch.where(swap, rel_0, rel_1)
+
+    rel = torch.zeros(n, k, 3, 3, device=state.pos.device)
+    rel[:, :kk] = _to_body(state.quat, _lift(torch.stack([rel_c, rel_0, rel_1], dim=2)))
+    full_dist = torch.full((n, k), sense_range, device=state.pos.device)
+    full_dist[:, :kk] = dist
+    return _encode_sensed(rel.flatten(2), full_dist, sense_range)
+
+
+def privileged_obs(state: DroneState, route: RouteState, elapsed_frac: torch.Tensor, cfg: dict) -> torch.Tensor:
+    """Critic-only: the next route waypoint (which may be a partition gap), remaining route length and time used. Dim 6."""
+    ocfg = cfg["obs"]
+    rel = _to_body(state.quat, route.waypoint - state.pos)
+    dist = rel.norm(dim=-1, keepdim=True)
+    return torch.cat(
+        [
+            rel / dist.clamp_min(1e-6),
+            dist.clamp_max(ocfg["goal_dist_clip"]) / ocfg["goal_dist_clip"],
+            route.remaining[:, None] / ocfg["route_len_scale"],
+            elapsed_frac[:, None],
+        ],
+        dim=-1,
+    )
 
 
 def _encode_sensed(rel: torch.Tensor, dist: torch.Tensor, sense_range: float) -> torch.Tensor:
+    """rel (N, k, d) and dist (N, k) -> (N, k * (d + 1)); unsensed entries read zero offset and distance 1."""
     sensed = dist < sense_range
     rel = torch.where(sensed[..., None], rel / sense_range, 0.0)
     dist = torch.where(sensed, dist, sense_range) / sense_range

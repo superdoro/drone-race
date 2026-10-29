@@ -1,7 +1,8 @@
 """Train the goal-navigation policy with rsl-rl PPO.
 
 Usage:
-    python train.py --num_envs 4096 --max_iterations 1500
+    python train.py --num_envs 4096 --max_iterations 3000 --exp_name rooms
+    python train.py --resume logs/rooms/<timestamp>/model_3000.pt --level 3   # continue from a curriculum level
     CUDA_VISIBLE_DEVICES=1 python train.py ...   # pick the GPU on a multi-GPU machine
 """
 
@@ -26,13 +27,15 @@ def main():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--num_envs", type=int, default=4096)
     parser.add_argument("--max_iterations", type=int, default=1500)
-    parser.add_argument("--exp_name", default="goal_nav")
+    parser.add_argument("--exp_name", default="rooms")
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--resume", default=None, help="checkpoint (.pt) to continue from")
+    parser.add_argument("--level", type=int, default=0, help="curriculum level to start at")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
     env_cfg, train_cfg = get_cfgs()
+    env_cfg["curriculum"]["initial_level"] = args.level
     log_dir = os.path.join("logs", args.exp_name, datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
     os.makedirs(log_dir, exist_ok=True)
     with open(os.path.join(log_dir, "cfgs.json"), "w") as f:

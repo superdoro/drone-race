@@ -42,12 +42,13 @@ class SimBackend(ABC):
         num_envs: int,
         obstacle_radii: list[float],
         obstacle_height: float,
-        wall_sizes: list[tuple[float, float, float]],
+        wall_thickness: float,
+        wall_height: float,
     ) -> None:
-        """Create the scene: ground, one drone per env, one vertical cylinder per obstacle slot and wall boxes.
+        """Create the scene: ground, one drone per env, one vertical cylinder per obstacle slot, and walls.
 
-        Obstacle radii and wall box sizes (local x, local y, height) are fixed at build time; the task decides per
-        env where each obstacle and wall goes.
+        Collisions and the state observations are computed analytically by the task, so obstacles and walls only need
+        to exist where something looks at them (viewer, video and, later, depth cameras).
         """
 
     @abstractmethod
@@ -59,8 +60,9 @@ class SimBackend(ABC):
         """Place obstacle slots of `env_ids` at `xy` (n, K, 2); inactive slots (n, K) must be hidden from sensors."""
 
     @abstractmethod
-    def set_walls(self, env_ids: torch.Tensor, centers: torch.Tensor, yaw: torch.Tensor) -> None:
-        """Place wall boxes of `env_ids`: xy centers (n, num_walls, 2), all rotated by `yaw` (n,) about z, on the ground."""
+    def set_walls(self, env_ids: torch.Tensor, segments: torch.Tensor, active: torch.Tensor) -> None:
+        """Lay out the walls of `env_ids`: center lines (n, S, 4) as x0, y0, x1, y1, standing on the ground, with the
+        thickness given at build time; inactive slots (n, S) must be hidden. Wall lengths differ per env and episode."""
 
     @abstractmethod
     def apply_rotor_thrusts(self, thrusts: torch.Tensor) -> None:
@@ -83,7 +85,7 @@ class SimBackend(ABC):
     def set_goal_markers(self, env_ids: torch.Tensor, pos: torch.Tensor) -> None:
         pass
 
-    def follow_camera(self, env_idx: int, target_pos: torch.Tensor, forward_xy: torch.Tensor) -> None:
+    def follow_camera(self, env_idx: int, target_pos: torch.Tensor) -> None:
         pass
 
     def start_recording(self, path: str, fps: int) -> None:

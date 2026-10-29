@@ -1,6 +1,8 @@
-# Install PyTorch first (CUDA build). RTX 50xx (Blackwell, sm_120) needs a CUDA >= 12.8 build; torch 2.15 + cu13 works.
+# Install PyTorch first (CUDA build). RTX 50xx (Blackwell, sm_120) needs a CUDA >= 12.8 build; torch 2.15 + cu132 works:
+#   pip install torch==2.15.0 --index-url https://download.pytorch.org/whl/cu132
 torch==2.15.0
 genesis-world==1.4.5
 rsl-rl-lib==5.5.1
 tensordict==0.15.3
 tensorboard==2.21.0
+matplotlib==3.11.2
