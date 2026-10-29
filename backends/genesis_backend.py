@@ -1,8 +1,6 @@
 """Genesis implementation of SimBackend. This is the only module that imports genesis."""
 
-import math
-import warnings
-
+import numpy as np
 import torch
 import genesis as gs
 
@@ -10,11 +8,9 @@ from backends.base import DroneState, SimBackend
 from config.drone_params import DroneParams
 from utils.math_utils import quat_rotate_inverse
 
-_HIDDEN_Z = -100.0  # unused obstacles / wall tiles are parked far below the ground plane
-# Genesis cannot resize a box after the scene is built, so a wall of any length is drawn with overlapping fixed-length
-# tiles. The room generator never makes a wall piece shorter than 0.5 m.
-_TILE_LENGTHS = (2.0, 0.5)
-_TILE_COUNTS = (200, 160)
+_HIDDEN_Z = -100.0  # obstacles and walls rest far below the ground plane until they are laid out
+_TRAIL_LENGTH = 90  # breadcrumbs behind the rendered drone, one every _TRAIL_EVERY camera updates
+_TRAIL_EVERY = 2
 
 
 class GenesisBackend(SimBackend):
@@ -39,44 +35,63 @@ class GenesisBackend(SimBackend):
         self.visual = show_viewer or render_camera
         self.rendered_env = rendered_env
         self.camera = None
+        self.view_camera = None
 
-    def build(self, num_envs, obstacle_radii, obstacle_height, wall_thickness, wall_height) -> None:
+    def build(self, num_envs, obstacle_radii, num_walls, wall_thickness) -> None:
         self.num_envs = num_envs
-        self.obstacle_height = obstacle_height
         self.wall_thickness = wall_thickness
-        self.wall_height = wall_height
         self.scene = gs.Scene(
             sim_options=gs.options.SimOptions(dt=self.dt, substeps=1),
             rigid_options=gs.options.RigidOptions(enable_collision=False, enable_joint_limit=False),
             viewer_options=gs.options.ViewerOptions(
                 camera_pos=(-3.0, -3.0, 10.0), camera_lookat=(3.0, 3.0, 0.0), camera_fov=60
             ),
-            vis_options=gs.options.VisOptions(rendered_envs_idx=[self.rendered_env]),
+            # No shadows: untextured walls lit by one sun cast large slanted shadows on each other, which made
+            # close-up (first-person) views unreadable. Brighter ambient light and a sky color keep faces distinct.
+            vis_options=gs.options.VisOptions(
+                rendered_envs_idx=[self.rendered_env], shadow=False, ambient_light=(0.35, 0.35, 0.35),
+                background_color=(0.62, 0.72, 0.82),
+            ),
             show_viewer=self.show_viewer,
         )
         self.scene.add_entity(gs.morphs.Plane())
         self.drone_entity = self.scene.add_entity(gs.morphs.Drone(file=self.drone.urdf, pos=(0.0, 0.0, 1.0)))
-        self.obstacles, self.wall_tiles, self.goal_marker = [], {}, None
+        # Unit shapes whose visual vertices are rewritten per env, so each gets its own size (Genesis cannot resize a
+        # built entity otherwise).
+        self.obstacles, self.walls, self.goal_marker, self.drone_marker, self.trail = [], [], None, None, []
         if self.visual:
-            self.obstacles = [self._fixed(gs.morphs.Cylinder, (0.85, 0.35, 0.15), radius=r, height=obstacle_height)
-                              for r in obstacle_radii]  # fmt: skip
-            self.wall_tiles = {
-                length: [self._fixed(gs.morphs.Box, (0.6, 0.62, 0.68), size=(length, wall_thickness, wall_height))
-                         for _ in range(count)]
-                for length, count in zip(_TILE_LENGTHS, _TILE_COUNTS)
-            }  # fmt: skip
-            self.goal_marker = self._fixed(gs.morphs.Sphere, (0.1, 0.8, 0.2), radius=0.15)
+            self.obstacles = [self._shape(gs.morphs.Cylinder, (0.85, 0.35, 0.15), radius=1.0, height=1.0)
+                              for _ in obstacle_radii]  # fmt: skip
+            self.walls = [self._shape(gs.morphs.Box, (0.6, 0.62, 0.68), size=(1.0, 1.0, 1.0)) for _ in range(num_walls)]
+            self.goal_marker = self.scene.add_entity(
+                gs.morphs.Sphere(radius=0.15, pos=(0.0, 0.0, _HIDDEN_Z), fixed=True, collision=False, batch_fixed_verts=True),
+                surface=gs.surfaces.Default(color=(0.1, 0.8, 0.2)),
+            )
+            # The Crazyflie mesh is a few pixels wide on screen: mark its collision sphere and a short trail.
+            self.drone_marker = self._marker(self.drone.body_radius, (1.0, 0.82, 0.1))
+            self.trail = [self._marker(0.025, (0.35, 0.8, 1.0)) for _ in range(_TRAIL_LENGTH)]
         if self.render_camera:
-            self.camera = self.scene.add_camera(res=(960, 540), fov=40, GUI=False)
+            # Far away with a narrow field of view: close to a top-down orthographic view, so tall walls do not lean
+            # over the rooms the way they do from a camera a few meters above them.
+            self.camera = self.scene.add_camera(res=(1280, 720), fov=9, near=30.0, far=60.0, GUI=False)
+            self.view_camera = self.scene.add_camera(res=(1280, 720), fov=75, near=0.05, far=40.0, GUI=False)
         self.scene.build(n_envs=num_envs)
 
         self._kf = self.drone.kf
         self._rendered_idx = torch.tensor([self.rendered_env], device=self.device)
-        self._warned_tiles = False
+        self._camera_updates = 0
+        if self.visual:
+            self._radii = torch.tensor(obstacle_radii, device=self.device)
+            parked = torch.tensor([0.0, 0.0, _HIDDEN_Z], device=self.device)
+            self._unit_cylinder = self.obstacles[0].get_vverts(envs_idx=self._rendered_idx)[0] - parked
+            self._unit_box = self.walls[0].get_vverts(envs_idx=self._rendered_idx)[0] - parked
 
-    def _fixed(self, morph_cls, color, **kwargs):
-        """A visual-only fixed entity whose pose can differ per env."""
-        morph = morph_cls(pos=(0.0, 0.0, _HIDDEN_Z), fixed=True, collision=False, batch_fixed_verts=True, **kwargs)
+    def _marker(self, radius, color):
+        morph = gs.morphs.Sphere(radius=radius, pos=(0.0, 0.0, _HIDDEN_Z), fixed=True, collision=False, batch_fixed_verts=True)
+        return self.scene.add_entity(morph, surface=gs.surfaces.Default(color=color))
+
+    def _shape(self, morph_cls, color, **kwargs):
+        morph = morph_cls(pos=(0.0, 0.0, _HIDDEN_Z), fixed=True, collision=False, enable_custom_vverts=True, **kwargs)
         return self.scene.add_entity(morph, surface=gs.surfaces.Default(color=color))
 
     def _rendered_row(self, env_ids: torch.Tensor) -> int | None:
@@ -86,48 +101,44 @@ class GenesisBackend(SimBackend):
         hit = (env_ids == self.rendered_env).nonzero()
         return int(hit[0, 0]) if hit.numel() > 0 else None
 
-    def _place(self, entity, x: float, y: float, z: float, yaw: float = 0.0) -> None:
-        entity.set_pos(torch.tensor([[x, y, z]], device=self.device), envs_idx=self._rendered_idx)
-        quat = [math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2)]
-        entity.set_quat(torch.tensor([quat], device=self.device), envs_idx=self._rendered_idx)
+    def _draw(self, entities, unit_verts, size, center, yaw, active) -> None:
+        """Scale the unit shape to `size` (K, 3), rotate it by `yaw` (K,) about z and move it to `center` (K, 3)."""
+        cos, sin = torch.cos(yaw)[:, None], torch.sin(yaw)[:, None]
+        v = unit_verts[None] * size[:, None]
+        v = torch.stack([cos * v[..., 0] - sin * v[..., 1], sin * v[..., 0] + cos * v[..., 1], v[..., 2]], dim=-1)
+        v = v + torch.where(active[:, None], center, torch.tensor([0.0, 0.0, _HIDDEN_Z], device=self.device))[:, None]
+        for entity, verts in zip(entities, v):
+            entity.set_vverts(verts[None], envs_idx=self._rendered_idx)
 
     def reset_drones(self, env_ids, pos, quat):
         self.drone_entity.set_pos(pos, envs_idx=env_ids, zero_velocity=True)
         self.drone_entity.set_quat(quat, envs_idx=env_ids, zero_velocity=True)
+        if self._rendered_row(env_ids) is not None:  # new episode: clear the trail
+            hidden = torch.tensor([[0.0, 0.0, _HIDDEN_Z]], device=self.device)
+            for crumb in self.trail:
+                crumb.set_pos(hidden, envs_idx=self._rendered_idx)
 
-    def set_obstacles(self, env_ids, xy, active):
+    def set_obstacles(self, env_ids, xy, z_range, active):
         row = self._rendered_row(env_ids)
         if row is None:
             return
-        for k, entity in enumerate(self.obstacles):
-            z = self.obstacle_height / 2 if bool(active[row, k]) else _HIDDEN_Z
-            self._place(entity, float(xy[row, k, 0]), float(xy[row, k, 1]), z)
+        z_lo, z_hi = z_range[row, :, 0], z_range[row, :, 1]
+        size = torch.stack([self._radii, self._radii, z_hi - z_lo], dim=-1)
+        center = torch.cat([xy[row], (0.5 * (z_lo + z_hi))[:, None]], dim=-1)
+        self._draw(self.obstacles, self._unit_cylinder, size, center, torch.zeros_like(z_lo), active[row])
 
-    def set_walls(self, env_ids, segments, active):
+    def set_walls(self, env_ids, segments, z_range, active):
         row = self._rendered_row(env_ids)
         if row is None:
             return
-        t = self.wall_thickness
-        placements = {length: [] for length in _TILE_LENGTHS}
-        for x0, y0, x1, y1 in segments[row][active[row]].tolist():
-            length = math.hypot(x1 - x0, y1 - y0)
-            ux, uy = (x1 - x0) / length, (y1 - y0) / length
-            length += t  # extend by half the thickness at both ends so that corners are closed
-            tile = next((size for size in _TILE_LENGTHS if length >= size), _TILE_LENGTHS[-1])
-            count = max(1, math.ceil(length / tile - 1e-6))
-            for i in range(count):
-                s = 0.5 * tile + (i * (length - tile) / (count - 1) if count > 1 else 0.5 * (length - tile))
-                placements[tile].append((x0 + ux * (s - 0.5 * t), y0 + uy * (s - 0.5 * t), math.atan2(uy, ux)))
-        for size, entities in self.wall_tiles.items():
-            if len(placements[size]) > len(entities) and not self._warned_tiles:
-                warnings.warn(f"Layout needs {len(placements[size])} wall tiles of {size} m, only {len(entities)} exist.")
-                self._warned_tiles = True
-            for j, entity in enumerate(entities):
-                if j < len(placements[size]):
-                    x, y, yaw = placements[size][j]
-                    self._place(entity, x, y, self.wall_height / 2, yaw)
-                else:
-                    self._place(entity, 0.0, 0.0, _HIDDEN_Z)
+        a, b = segments[row, :, :2], segments[row, :, 2:]
+        z_lo, z_hi = z_range[row, :, 0], z_range[row, :, 1]
+        t = torch.full_like(z_lo, self.wall_thickness)
+        # extend by half the thickness at both ends so that corners are closed
+        size = torch.stack([(b - a).norm(dim=-1) + t, t, z_hi - z_lo], dim=-1)
+        center = torch.cat([0.5 * (a + b), (0.5 * (z_lo + z_hi))[:, None]], dim=-1)
+        yaw = torch.atan2(b[:, 1] - a[:, 1], b[:, 0] - a[:, 0])
+        self._draw(self.walls, self._unit_box, size, center, yaw, active[row])
 
     def apply_rotor_thrusts(self, thrusts):
         self.drone_entity.set_propellers_rpm(torch.sqrt(thrusts.clamp_min(0.0) / self._kf))
@@ -149,15 +160,25 @@ class GenesisBackend(SimBackend):
     def set_goal_markers(self, env_ids, pos):
         row = self._rendered_row(env_ids)
         if row is not None:
-            self._place(self.goal_marker, *pos[row].tolist())
+            self.goal_marker.set_pos(pos[row][None], envs_idx=self._rendered_idx)
 
     def follow_camera(self, env_idx, target_pos):
+        if self.drone_marker is not None:
+            pos = target_pos.detach()[None]
+            self.drone_marker.set_pos(pos, envs_idx=self._rendered_idx)
+            if self._camera_updates % _TRAIL_EVERY == 0:
+                self.trail[(self._camera_updates // _TRAIL_EVERY) % _TRAIL_LENGTH].set_pos(pos, envs_idx=self._rendered_idx)
+            self._camera_updates += 1
         if self.camera is not None:
             target = target_pos.detach().cpu().numpy()
-            # High, narrow, slightly tilted view from above: little perspective lean on the 4 m walls, and no wall
-            # blocks the drone. Pass `up` every time: Genesis otherwise reuses the previous frame's tilted up vector
-            # and the view rolls.
-            self.camera.set_pose(pos=target + [0.0, -2.0, 16.0], lookat=target, up=(0.0, 0.0, 1.0))
+            # Pass `up` every time: Genesis otherwise reuses the previous frame's tilted up vector and the view rolls.
+            self.camera.set_pose(pos=target + [0.0, -3.0, 45.0], lookat=target, up=(0.0, 0.0, 1.0))
+
+    def render_view(self, eye, lookat):
+        if self.view_camera is None:
+            raise RuntimeError("Build the backend with render_camera=True to render views.")
+        self.view_camera.set_pose(pos=eye.detach().cpu().numpy(), lookat=lookat.detach().cpu().numpy(), up=(0.0, 0.0, 1.0))
+        return np.asarray(self.view_camera.render()[0])
 
     def start_recording(self, path, fps):
         if self.camera is None:

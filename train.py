@@ -1,12 +1,14 @@
 """Train the goal-navigation policy with rsl-rl PPO.
 
 Usage:
-    python train.py --num_envs 4096 --max_iterations 3000 --exp_name rooms
-    python train.py --resume logs/rooms/<timestamp>/model_3000.pt --level 3   # continue from a curriculum level
+    python train.py --num_envs 4096 --max_iterations 8000 --exp_name rooms3d
+    python train.py --resume logs/rooms3d/<timestamp>/model_7999.pt --level 5   # continue from a curriculum level
+    python train.py ... --set rewards.approach_wall=0 rewards.slow_clearance=0     # override env config values
     CUDA_VISIBLE_DEVICES=1 python train.py ...   # pick the GPU on a multi-GPU machine
 """
 
 import argparse
+import ast
 import copy
 import json
 import os
@@ -21,6 +23,22 @@ from config.task_cfg import get_cfgs
 from task.goal_nav_task import GoalNavTask
 
 
+def apply_overrides(cfg: dict, overrides: list[str]) -> None:
+    """Set nested config values from "a.b.c=value" strings (value parsed as a Python literal, else kept a string)."""
+    for item in overrides:
+        path, _, raw = item.partition("=")
+        *parents, key = path.split(".")
+        node = cfg
+        for p in parents:
+            node = node[p]
+        if key not in node:
+            raise KeyError(f"--set {path}: no such config key")
+        try:
+            node[key] = ast.literal_eval(raw)
+        except (ValueError, SyntaxError):
+            node[key] = raw
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--backend", default="genesis")
@@ -31,11 +49,13 @@ def main():
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--resume", default=None, help="checkpoint (.pt) to continue from")
     parser.add_argument("--level", type=int, default=0, help="curriculum level to start at")
+    parser.add_argument("--set", nargs="*", default=[], metavar="KEY=VALUE", help="override env config values")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
     env_cfg, train_cfg = get_cfgs()
     env_cfg["curriculum"]["initial_level"] = args.level
+    apply_overrides(env_cfg, args.set)
     log_dir = os.path.join("logs", args.exp_name, datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
     os.makedirs(log_dir, exist_ok=True)
     with open(os.path.join(log_dir, "cfgs.json"), "w") as f:

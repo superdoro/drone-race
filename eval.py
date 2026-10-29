@@ -4,6 +4,7 @@ Usage:
     python eval.py --run logs/rooms/<timestamp>                       # latest checkpoint, hardest level
     python eval.py --run logs/rooms/<timestamp> --level 2 --record    # also save an mp4 of env 0
     python eval.py --run logs/rooms/<timestamp> --rooms 6 6 --pillars 5 5 --partitions 2 2   # a specific setting
+    python eval.py --run logs/rooms/<timestamp> --vertical 1.0 --ceiling 2.5 2.5    # every door a window, low rooms
     python eval.py --run logs/rooms/<timestamp> --plot 12             # top-down trajectories of 12 episodes
     python eval.py --run logs/rooms/<timestamp> --viewer --num_envs 1
 """
@@ -12,6 +13,7 @@ import argparse
 import copy
 import glob
 import json
+import math
 import os
 import re
 
@@ -20,9 +22,21 @@ from rsl_rl.runners import OnPolicyRunner
 
 from backends.base import make_backend
 from config.drone_params import DRONES
+from config.task_cfg import get_cfgs
 from task.goal_nav_task import GoalNavTask
 
-LEVEL_KEYS = ("rooms", "partitions", "free_walls", "pillars", "door_width")
+LEVEL_KEYS = ("rooms", "partitions", "free_walls", "pillars", "door_width", "ceiling", "vertical")
+
+
+def overlay(defaults: dict, saved: dict) -> dict:
+    """The run's saved config on top of today's defaults, so keys added after the run was trained (e.g. new reward
+    terms, which do not change what the policy does) still have a value."""
+    for key, value in saved.items():
+        if isinstance(value, dict) and isinstance(defaults.get(key), dict):
+            overlay(defaults[key], value)
+        else:
+            defaults[key] = value
+    return defaults
 
 
 def latest_checkpoint(run_dir: str) -> str:
@@ -42,6 +56,8 @@ def main():
     parser.add_argument("--free_walls", type=int, nargs=2, metavar=("MIN", "MAX"), help="override free walls per room")
     parser.add_argument("--pillars", type=int, nargs=2, metavar=("MIN", "MAX"), help="override pillars per room")
     parser.add_argument("--door_width", type=float, nargs=2, metavar=("MIN", "MAX"), help="override door width (m)")
+    parser.add_argument("--ceiling", type=float, nargs=2, metavar=("MIN", "MAX"), help="override room ceiling height (m)")
+    parser.add_argument("--vertical", type=float, help="override the share of height-limited doors / walls / pillars")
     parser.add_argument("--num_envs", type=int, default=256)
     parser.add_argument("--episodes", type=int, default=1000)
     parser.add_argument("--viewer", action="store_true")
@@ -53,16 +69,17 @@ def main():
 
     with open(os.path.join(args.run, "cfgs.json")) as f:
         saved = json.load(f)
-    env_cfg, train_cfg = saved["env_cfg"], saved["train_cfg"]
+    env_cfg, train_cfg = overlay(get_cfgs()[0], saved["env_cfg"]), saved["train_cfg"]
     levels = env_cfg["curriculum"]["levels"]
     level_idx = args.level % len(levels)
     level = dict(levels[level_idx])
     for key in LEVEL_KEYS:
-        if getattr(args, key):
+        if getattr(args, key) is not None:
             level[key] = getattr(args, key)
     levels[level_idx] = level
     env_cfg["curriculum"]["initial_level"] = level_idx
     env_cfg["curriculum"]["promote_success_rate"] = 2.0  # never change level during evaluation
+    env_cfg["curriculum"]["replay"] = 0.0  # only the evaluated level
     env_cfg["rooms"]["pool_size"] = min(env_cfg["rooms"]["pool_size"], max(args.episodes, args.num_envs))
     args.num_envs = max(args.num_envs, args.plot)
 
@@ -79,7 +96,10 @@ def main():
     ckpt = args.ckpt or latest_checkpoint(args.run)
     runner.load(ckpt)
     policy = runner.get_inference_policy(device=str(env.device))
-    setting = ", ".join(f"{key} {level[key][0]:g}-{level[key][1]:g}" for key in LEVEL_KEYS)
+    setting = ", ".join(
+        f"{key} {level[key][0]:g}-{level[key][1]:g}" if isinstance(level[key], (list, tuple)) else f"{key} {level[key]:g}"
+        for key in LEVEL_KEYS
+    )
     print(f"Loaded {ckpt}; evaluating level {level_idx}: {setting}")
 
     video_path = None
@@ -93,24 +113,32 @@ def main():
     plot_traj = [[] for _ in range(args.plot)]
     plot_outcome = [None] * args.plot
 
+    # Every env contributes exactly its first `per_env` episodes. Stopping at a total count instead would over-sample
+    # short episodes (crashes end sooner than successful flights) and understate the success rate.
+    per_env = math.ceil(args.episodes / env.num_envs)
+    counts = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
     metrics: dict[str, list[torch.Tensor]] = {}
-    finished, step = 0, 0
+    step = 0
     obs = env.get_observations()
     with torch.inference_mode():
-        while finished < args.episodes or (args.record and step < record_steps) or None in plot_outcome:
+        while (counts < per_env).any() or (args.record and step < record_steps) or None in plot_outcome:
             pos = backend.get_drone_state().pos
             for i in range(args.plot):
                 if plot_outcome[i] is None:
-                    plot_traj[i].append(pos[i, :2].tolist())
+                    plot_traj[i].append(pos[i].tolist())
             obs, _, dones, extras = env.step(policy(obs))
-            finished += int(dones.sum())
             step += 1
             log = extras["log"]
-            for key, value in log.items():
-                if key.startswith("Metrics/"):
-                    metrics.setdefault(key, []).append(value.flatten())
+            ended = dones.nonzero().flatten()
+            keep = counts[ended] < per_env
+            counts[ended] += 1
+            if ended.numel() > 0:
+                success = log["Metrics/success_rate"] > 0
+                for key, value in log.items():
+                    if key.startswith("Metrics/"):  # success-only metrics hold one entry per successful episode
+                        value = value.flatten()
+                        metrics.setdefault(key, []).append(value[keep] if value.numel() == ended.numel() else value[keep[success]])
             if args.plot and dones[: args.plot].any():
-                ended = dones.nonzero().flatten()
                 for row, i in enumerate(ended.tolist()):
                     if i < args.plot and plot_outcome[i] is None:
                         plot_outcome[i] = next(
@@ -123,7 +151,8 @@ def main():
             if args.record and step == record_steps:
                 backend.stop_recording()
 
-    print(f"\n=== {finished} episodes on level {level_idx} ({setting}) ===")
+    finished = per_env * env.num_envs
+    print(f"\n=== {finished} episodes ({per_env} per env) on level {level_idx} ({setting}) ===")
     for key, values in metrics.items():
         print(f"{key[len('Metrics/'):]:>18}: {torch.cat(values).mean().item():.3f}")
     if video_path:

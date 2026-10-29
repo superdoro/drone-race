@@ -37,15 +37,9 @@ class SimBackend(ABC):
         self.dt = dt
 
     @abstractmethod
-    def build(
-        self,
-        num_envs: int,
-        obstacle_radii: list[float],
-        obstacle_height: float,
-        wall_thickness: float,
-        wall_height: float,
-    ) -> None:
-        """Create the scene: ground, one drone per env, one vertical cylinder per obstacle slot, and walls.
+    def build(self, num_envs: int, obstacle_radii: list[float], num_walls: int, wall_thickness: float) -> None:
+        """Create the scene: ground, one drone per env, one vertical cylinder per obstacle slot and `num_walls` wall
+        slots.
 
         Collisions and the state observations are computed analytically by the task, so obstacles and walls only need
         to exist where something looks at them (viewer, video and, later, depth cameras).
@@ -56,13 +50,14 @@ class SimBackend(ABC):
         """Teleport the drones of `env_ids` to `pos` / `quat` with zero velocity."""
 
     @abstractmethod
-    def set_obstacles(self, env_ids: torch.Tensor, xy: torch.Tensor, active: torch.Tensor) -> None:
-        """Place obstacle slots of `env_ids` at `xy` (n, K, 2); inactive slots (n, K) must be hidden from sensors."""
+    def set_obstacles(self, env_ids: torch.Tensor, xy: torch.Tensor, z_range: torch.Tensor, active: torch.Tensor) -> None:
+        """Place obstacle slots of `env_ids`: axis at `xy` (n, K, 2), spanning heights `z_range` (n, K, 2); inactive
+        slots (n, K) must be hidden from sensors."""
 
     @abstractmethod
-    def set_walls(self, env_ids: torch.Tensor, segments: torch.Tensor, active: torch.Tensor) -> None:
-        """Lay out the walls of `env_ids`: center lines (n, S, 4) as x0, y0, x1, y1, standing on the ground, with the
-        thickness given at build time; inactive slots (n, S) must be hidden. Wall lengths differ per env and episode."""
+    def set_walls(self, env_ids: torch.Tensor, segments: torch.Tensor, z_range: torch.Tensor, active: torch.Tensor) -> None:
+        """Lay out the walls of `env_ids`: center lines (n, S, 4) as x0, y0, x1, y1 over heights `z_range` (n, S, 2),
+        with the thickness given at build time; inactive slots (n, S) must be hidden. Sizes differ per env and episode."""
 
     @abstractmethod
     def apply_rotor_thrusts(self, thrusts: torch.Tensor) -> None:
@@ -86,7 +81,11 @@ class SimBackend(ABC):
         pass
 
     def follow_camera(self, env_idx: int, target_pos: torch.Tensor) -> None:
-        pass
+        """Point the recording camera at the drone of `env_idx` and update any drone marker / trail drawn for it."""
+
+    def render_view(self, eye: torch.Tensor, lookat: torch.Tensor):
+        """RGB image (H, W, 3) uint8 of the rendered env seen from `eye` toward `lookat` (first-person video)."""
+        raise NotImplementedError("Free-view rendering is not supported by this backend.")
 
     def start_recording(self, path: str, fps: int) -> None:
         raise NotImplementedError("Video recording is not supported by this backend.")

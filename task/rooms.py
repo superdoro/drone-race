@@ -1,20 +1,25 @@
-"""Random chains of rectangular rooms with pillars and interior walls. Generated in plain Python, served from a GPU pool.
+"""Random chains of rectangular rooms with walls, openings and pillars at any height. Generated in plain Python, served
+from a GPU pool.
 
 One layout:
-  * A chain of axis-aligned rooms. Room r + 1 is attached to a side of room r other than the one the route enters
-    through, and the two are joined by a single door at a random place in the shared wall; every other wall is closed,
-    so there is exactly one route from the start (next to a wall of room 0) to the goal (next to a wall of the last room).
-  * Inside a room: partitions (walls across the whole room with one gap; successive gaps tend to alternate sides, which
-    forces a zig-zag), free-standing wall segments at any angle, and cylindrical pillars.
-  * Every layout is passable by construction: partitions are parallel and each gap is at least the minimum door width,
-    and every pillar / free wall keeps at least `pass_gap` from every other obstacle and wall, so none of them can seal a
-    passage off.
+  * A chain of axis-aligned rooms, each with its own ceiling height. Room r + 1 is attached to a side of room r other
+    than the one the route enters through, and the two are joined by a single door at a random place in the shared wall;
+    every other wall is closed, so there is exactly one route from the start (next to a wall of room 0) to the goal (next
+    to a wall of the last room). A door can be a window: an opening that starts above the floor.
+  * Inside a room: partitions across the whole room, passable only through their opening (a gap, a window, above a low
+    wall or below a hanging wall; successive gaps tend to alternate sides, which forces a zig-zag), free-standing walls
+    at any angle, and cylindrical pillars. Free walls and pillars can be full height, low or hanging, and a free wall
+    can also be a beam in mid-air.
+  * Every layout is passable by construction: partitions are parallel, every opening is at least the minimum door width
+    wide and `min_passage` high, and every pillar / free wall keeps at least `pass_gap` horizontally from every other
+    obstacle and wall, so whatever its height it can never seal a passage off.
 
-Walls are line segments of thickness `wall_thickness`; all geometry is analytic (see task/geometry.py).
+Every obstacle is a vertical extrusion of a 2D shape (a wall center line of thickness `wall_thickness`, or a disc) over
+a height interval [z_lo, z_hi]. All geometry is analytic (see task/geometry.py).
 
-Route waypoints: per room, the gap centers of its partitions in crossing order, then its exit (the door to the next room,
-or the goal). The progress reward follows them, so it never asks the drone to push through a wall; the policy itself
-only observes the doors, never the gaps.
+Route waypoints (3D): per room, the openings of its partitions in crossing order, then its exit (the door to the next
+room, or the goal). The progress reward follows them, so it never asks the drone to push through a wall or a partition;
+the policy itself only observes the doors, never the partition openings.
 """
 
 import math
@@ -52,6 +57,11 @@ class Rect:
         x, y = (fixed, u) if s in (W, E) else (u, fixed)
         return x - inset * OUTWARD[s][0], y - inset * OUTWARD[s][1]
 
+    def wall(self, s: int, a: float, b: float, z_lo: float, z_hi: float) -> tuple[float, ...]:
+        """Wall segment along side `s` from a to b (along the wall) over [z_lo, z_hi]."""
+        fixed = self.side(s)[0]
+        return (fixed, a, fixed, b, z_lo, z_hi) if s in (W, E) else (a, fixed, b, fixed, z_lo, z_hi)
+
     def extent(self, axis: int) -> tuple[float, float]:
         return (self.x0, self.x1) if axis == 0 else (self.y0, self.y1)
 
@@ -81,24 +91,26 @@ class Port:
 @dataclass
 class Layout:
     rooms: list[Rect]
-    segments: list[tuple[float, float, float, float]]  # walls: (x0, y0, x1, y1)
+    ceilings: list[float]
+    segments: list[tuple[float, ...]]  # walls: (x0, y0, x1, y1, z_lo, z_hi)
     free_standing: list[bool]  # per segment: a free-standing wall, i.e. not a room wall or partition
-    pillars: list[tuple[int, float, float]]  # (radius slot, x, y)
-    partitions: list[list[tuple[float, float, float, float]]]  # per room: gap center and unit normal toward the exit
-    waypoints: list[tuple[float, float]]
+    pillars: list[tuple[int, float, float, float, float]]  # (radius slot, x, y, z_lo, z_hi)
+    partitions: list[list[tuple[float, float, float, float]]]  # per room: point on each partition, normal toward exit
+    waypoints: list[tuple[float, float, float]]
     first_wp: list[int]  # per room: index of its first waypoint
     exit_wp: list[int]  # per room: index of its exit waypoint
     exit_normal: list[tuple[float, float]]  # per room: crossing direction of its exit door, (0, 0) for the goal
     exit_width: list[float]  # per room: exit door width, 0 for the goal
-    start: tuple[float, float]
-    goal: tuple[float, float]
+    exit_z: list[tuple[float, float]]  # per room: height interval of the exit door's opening, (0, 0) for the goal
+    start: tuple[float, float, float]
+    goal: tuple[float, float, float]
 
 
-# ---------------------------------------------------------------- scalar geometry
+# ---------------------------------------------------------------- scalar geometry (horizontal)
 
 
 def _point_seg_dist(px: float, py: float, seg) -> float:
-    x0, y0, x1, y1 = seg
+    x0, y0, x1, y1 = seg[:4]
     dx, dy = x1 - x0, y1 - y0
     len2 = dx * dx + dy * dy
     t = 0.0 if len2 == 0.0 else min(1.0, max(0.0, ((px - x0) * dx + (py - y0) * dy) / len2))
@@ -110,6 +122,7 @@ def _cross(ax, ay, bx, by, cx, cy) -> float:
 
 
 def _seg_seg_dist(a, b) -> float:
+    a, b = a[:4], b[:4]
     d1, d2 = _cross(*a[:2], *a[2:], *b[:2]), _cross(*a[:2], *a[2:], *b[2:])
     d3, d4 = _cross(*b[:2], *b[2:], *a[:2]), _cross(*b[:2], *b[2:], *a[2:])
     if d1 * d2 < 0.0 and d3 * d4 < 0.0:
@@ -138,6 +151,7 @@ def _subtract(lo: float, hi: float, holes: list[tuple[float, float]]) -> list[tu
 class LayoutGenerator:
     def __init__(self, cfg: dict, pillar_radii: list[float], seed: int = 0):
         self.c = cfg["rooms"]
+        self.top = self.c["wall_top"]
         self.radii = pillar_radii
         self.rng = random.Random(seed)
 
@@ -205,16 +219,32 @@ class LayoutGenerator:
         x, y = rect.point_on_side(side, self.rng.uniform(lo + inset, hi - inset), inset)
         return Port(x, y, side, 0.0)
 
+    def _window(self, ceiling: float) -> tuple[float, float]:
+        """Height interval of a window-like opening under `ceiling`."""
+        c = self.c
+        height = self.rng.uniform(*c["window_height"])
+        sill = self.rng.uniform(c["window_margin"], ceiling - c["window_margin"] - height)
+        return sill, sill + height
+
+    def _spawn_z(self, ceiling: float) -> float:
+        lo, hi = self.c["spawn_z"]
+        return self.rng.uniform(lo, min(hi, ceiling - self.c["min_passage"]))
+
     def _furnish(self, rects, entry_sides, doors, level) -> Layout:
-        c, rng = self.c, self.rng
+        c, rng, top = self.c, self.rng, self.top
         n = len(rects)
+        vertical = level["vertical"]
+        ceilings = [rng.uniform(*level["ceiling"]) for _ in rects]
         start = self._inner_port(rects[0], entry_sides[0], c["start_inset"])
         goal = self._inner_port(rects[-1], rng.choice([s for s in range(4) if s != entry_sides[-1]]), c["goal_inset"])
-        ins, outs = [start], []
+        start_z, goal_z = self._spawn_z(ceilings[0]), self._spawn_z(ceilings[-1])
+        ins, outs, door_z = [start], [], []
         for r, (side, u, width) in enumerate(doors):
             x, y = rects[r].point_on_side(side, u)
             outs.append(Port(x, y, side, 0.5 * width))
             ins.append(Port(x, y, OPPOSITE[side], 0.5 * width))
+            ceiling = min(ceilings[r], ceilings[r + 1])
+            door_z.append(self._window(ceiling) if rng.random() < vertical else (0.0, ceiling))
         outs.append(goal)
 
         segments = []
@@ -227,32 +257,49 @@ class LayoutGenerator:
                 holes[OPPOSITE[prev_side]].append((max(lo, p_lo), min(hi, p_hi)))
             if r < n - 1:
                 side, u, width = doors[r]
-                holes[side].append((u - 0.5 * width, u + 0.5 * width))
+                a, b = u - 0.5 * width, u + 0.5 * width
+                holes[side].append((a, b))
+                z_lo, z_hi = door_z[r]
+                if z_lo > 0.0:  # window: wall below and above the opening
+                    segments += [rect.wall(side, a, b, 0.0, z_lo), rect.wall(side, a, b, z_hi, top)]
             for s in range(4):
-                fixed, lo, hi = rect.side(s)
-                for a, b in _subtract(lo, hi, holes[s]):
-                    segments.append((fixed, a, fixed, b) if s in (W, E) else (a, fixed, b, fixed))
+                segments += [rect.wall(s, a, b, 0.0, top) for a, b in _subtract(*rect.side(s)[1:], holes[s])]
 
         free_standing = [False] * len(segments)
-        pillars, partitions, waypoints, first_wp, exit_wp = [], [], [], [], []
+        pillars, partitions, first_wp, exit_wp = [], [], [], []
+        wp_specs = []  # (x, y, z_lo, z_hi) of each waypoint's opening; heights are resolved below
         free_slots = list(range(len(self.radii)))
         rng.shuffle(free_slots)
         for r, rect in enumerate(rects):
-            gaps, inner = self._partitions(rect, ins[r], outs[r], rng.randint(*level["partitions"]), level["door_width"])
-            route = [(ins[r].x, ins[r].y)] + [(gx, gy) for gx, gy, _, _ in gaps] + [(outs[r].x, outs[r].y)]
+            count = rng.randint(*level["partitions"])
+            gaps, inner, openings = self._partitions(rect, ceilings[r], ins[r], outs[r], count, level)
+            route = [(ins[r].x, ins[r].y)] + [(x, y) for x, y, _, _ in openings] + [(outs[r].x, outs[r].y)]
             num_partition_segs = len(inner)
-            self._free_walls(rect, route, inner, rng.randint(*level["free_walls"]))
-            pillars += self._pillars(rect, route, inner, rng.randint(*level["pillars"]), free_slots)
+            self._free_walls(rect, ceilings[r], route, inner, rng.randint(*level["free_walls"]), vertical)
+            pillars += self._pillars(rect, ceilings[r], route, inner, rng.randint(*level["pillars"]), free_slots, vertical)
             segments += inner
             free_standing += [k >= num_partition_segs for k in range(len(inner))]
             partitions.append(gaps)
-            first_wp.append(len(waypoints))
-            waypoints += route[1:-1]
-            exit_wp.append(len(waypoints))
-            waypoints.append(route[-1])
+            first_wp.append(len(wp_specs))
+            wp_specs += openings
+            exit_wp.append(len(wp_specs))
+            if r < n - 1:
+                wp_specs.append((outs[r].x, outs[r].y, *door_z[r]))
+            else:
+                wp_specs.append((goal.x, goal.y, goal_z, goal_z))
+
+        # Waypoint heights, from the goal backward: keep the next waypoint's height if it fits through this opening
+        # (with a margin), otherwise the closest height that does.
+        waypoints, z = [], goal_z
+        for x, y, z_lo, z_hi in reversed(wp_specs):
+            margin = min(c["waypoint_z_margin"], 0.5 * (z_hi - z_lo))
+            z = min(max(z, z_lo + margin), z_hi - margin)
+            waypoints.append((x, y, z))
+        waypoints.reverse()
 
         return Layout(
             rooms=rects,
+            ceilings=ceilings,
             segments=segments,
             free_standing=free_standing,
             pillars=pillars,
@@ -262,19 +309,20 @@ class LayoutGenerator:
             exit_wp=exit_wp,
             exit_normal=[OUTWARD[side] for side, _, _ in doors] + [(0.0, 0.0)],
             exit_width=[width for _, _, width in doors] + [0.0],
-            start=(start.x, start.y),
-            goal=(goal.x, goal.y),
+            exit_z=door_z + [(0.0, 0.0)],
+            start=(start.x, start.y, start_z),
+            goal=(goal.x, goal.y, goal_z),
         )
 
-    def _partitions(self, rect: Rect, p_in: Port, p_out: Port, count: int, door_width):
-        """Parallel walls across the room between its entry and exit, each with one gap.
+    def _partitions(self, rect: Rect, ceiling: float, p_in: Port, p_out: Port, count: int, level: dict):
+        """Parallel walls across the room between its entry and exit, each passable only through one opening.
 
-        Returns the gaps in crossing order as (center x, center y, normal x, normal y), normal pointing toward the
-        exit, and the wall segments.
+        Returns, in crossing order, a point on each partition with the unit normal toward the exit, the wall segments,
+        and the openings as (x, y, z_lo, z_hi) with (x, y) on the partition.
         """
-        c, rng = self.c, self.rng
+        c, rng, top = self.c, self.rng, self.top
         if count == 0:
-            return [], []
+            return [], [], []
         clear, spacing = c["partition_clearance"], c["partition_spacing"]
         options = []  # partitions are perpendicular to an axis along which entry and exit are far enough apart
         for axis in (0, 1):
@@ -287,7 +335,7 @@ class LayoutGenerator:
             if hi >= lo:
                 options.append((axis, lo, hi, sign))
         if not options:
-            return [], []
+            return [], [], []
         axis, lo, hi, sign = rng.choice(options)
         count = min(count, int((hi - lo) / spacing) + 1)
         slack = hi - lo - (count - 1) * spacing
@@ -297,24 +345,53 @@ class LayoutGenerator:
 
         b0, b1 = rect.extent(1 - axis)
         mid = 0.5 * (b0 + b1)
+        a_in, b_in = (p_in.x, p_in.y) if axis == 0 else (p_in.y, p_in.x)
+        a_out, b_out = (p_out.x, p_out.y) if axis == 0 else (p_out.y, p_out.x)
+
+        def point(coord, along):
+            return (coord, along) if axis == 0 else (along, coord)
+
+        def piece(coord, a, b, z_lo, z_hi):
+            return (*point(coord, a), *point(coord, b), z_lo, z_hi)
+
         low_half = rng.random() < 0.5
-        gaps, segs = [], []
+        gaps, segs, openings = [], [], []
         for k, coord in enumerate(coords):
-            if k > 0 and rng.random() < c["zigzag_prob"]:
-                low_half = not low_half
-            half = 0.5 * rng.uniform(*door_width)
-            lo_g, hi_g = (b0 + half, mid) if low_half else (mid, b1 - half)
-            center = rng.uniform(min(lo_g, hi_g), max(lo_g, hi_g))
-            # a wall stub shorter than door_margin would just be a sliver: make the gap flush with the room wall instead
-            if center - half - b0 < c["door_margin"]:
-                center = b0 + half
-            elif b1 - center - half < c["door_margin"]:
-                center = b1 - half
-            for a, b in _subtract(b0, b1, [(center - half, center + half)]):
-                segs.append((coord, a, coord, b) if axis == 0 else (a, coord, b, coord))
-            gx, gy = (coord, center) if axis == 0 else (center, coord)
-            gaps.append((gx, gy, sign, 0.0) if axis == 0 else (gx, gy, 0.0, sign))
-        return gaps, segs
+            kind = rng.choice(("window", "over", "under")) if rng.random() < level["vertical"] else "gap"
+            if kind in ("gap", "window"):
+                if k > 0 and rng.random() < c["zigzag_prob"]:
+                    low_half = not low_half
+                half = 0.5 * rng.uniform(*level["door_width"])
+                lo_g, hi_g = (b0 + half, mid) if low_half else (mid, b1 - half)
+                center = rng.uniform(min(lo_g, hi_g), max(lo_g, hi_g))
+                # a wall stub shorter than door_margin would just be a sliver: make the gap flush with the wall instead
+                if center - half - b0 < c["door_margin"]:
+                    center = b0 + half
+                elif b1 - center - half < c["door_margin"]:
+                    center = b1 - half
+                segs += [piece(coord, a, b, 0.0, top) for a, b in _subtract(b0, b1, [(center - half, center + half)])]
+                z_lo, z_hi = 0.0, ceiling
+                if kind == "window":
+                    z_lo, z_hi = self._window(ceiling)
+                    segs += [piece(coord, center - half, center + half, 0.0, z_lo),
+                             piece(coord, center - half, center + half, z_hi, top)]  # fmt: skip
+            else:
+                # The opening spans the whole room width; put its waypoint where the straight entry-exit line crosses.
+                f = (coord - a_in) / (a_out - a_in) if abs(a_out - a_in) > 1e-6 else 0.5
+                margin = c["door_margin"]
+                center = min(max(b_in + f * (b_out - b_in), b0 + margin), b1 - margin)
+                if kind == "over":  # low wall: fly over it
+                    height = min(rng.uniform(*c["low_height"]), ceiling - c["min_passage"])
+                    segs.append(piece(coord, b0, b1, 0.0, height))
+                    z_lo, z_hi = height, ceiling
+                else:  # hanging wall: fly under it
+                    bottom = rng.uniform(*c["hanging_bottom"])
+                    segs.append(piece(coord, b0, b1, bottom, top))
+                    z_lo, z_hi = 0.0, bottom
+            x, y = point(coord, center)
+            gaps.append((x, y, sign, 0.0) if axis == 0 else (x, y, 0.0, sign))
+            openings.append((x, y, z_lo, z_hi))
+        return gaps, segs, openings
 
     def _sample_point(self, rect: Rect, route: list[tuple[float, float]]) -> tuple[float, float]:
         """Mostly near the straight route through the room (so obstacles are in the way), otherwise anywhere in it."""
@@ -332,7 +409,21 @@ class LayoutGenerator:
             return ax + f * (bx - ax) - lateral * (by - ay), ay + f * (by - ay) + lateral * (bx - ax)
         return rng.uniform(rect.x0, rect.x1), rng.uniform(rect.y0, rect.y1)
 
-    def _free_walls(self, rect: Rect, route, segs: list, count: int) -> None:
+    def _vertical_extent(self, ceiling: float, vertical: float, beam: bool) -> tuple[float, float]:
+        """Height interval of a free wall / pillar: full height, or with probability `vertical` low, hanging or a beam."""
+        c, rng = self.c, self.rng
+        if rng.random() >= vertical:
+            return 0.0, self.top
+        kind = rng.choice(("low", "hanging", "beam") if beam else ("low", "hanging"))
+        if kind == "low":
+            return 0.0, min(rng.uniform(*c["low_height"]), ceiling - c["min_passage"])
+        if kind == "hanging":
+            return rng.uniform(*c["hanging_bottom"]), self.top
+        thickness = rng.uniform(*c["beam_thickness"])
+        z_lo = min(rng.uniform(*c["beam_z"]), ceiling - c["min_passage"] - thickness)
+        return z_lo, z_lo + thickness
+
+    def _free_walls(self, rect: Rect, ceiling: float, route, segs: list, count: int, vertical: float) -> None:
         """Append up to `count` free-standing wall segments to `segs` (which holds the room's partitions)."""
         c, rng = self.c, self.rng
         t, gap = c["wall_thickness"], c["pass_gap"]
@@ -348,10 +439,10 @@ class LayoutGenerator:
                     continue
                 if any(_point_seg_dist(px, py, seg) < c["port_clearance"] for px, py in route):
                     continue
-                segs.append(seg)
+                segs.append((*seg, *self._vertical_extent(ceiling, vertical, beam=True)))
                 break
 
-    def _pillars(self, rect: Rect, route, segs, count: int, free_slots: list[int]):
+    def _pillars(self, rect: Rect, ceiling: float, route, segs, count: int, free_slots: list[int], vertical: float):
         c, rng = self.c, self.rng
         t, gap = c["wall_thickness"], c["pass_gap"]
         placed = []
@@ -366,11 +457,11 @@ class LayoutGenerator:
                     continue
                 if any(_point_seg_dist(x, y, s) < r + 0.5 * t + gap for s in segs):
                     continue
-                if any(math.hypot(x - px, y - py) < r + self.radii[ps] + gap for ps, px, py in placed):
+                if any(math.hypot(x - px, y - py) < r + self.radii[ps] + gap for ps, px, py, _, _ in placed):
                     continue
                 if any(math.hypot(x - px, y - py) < c["port_clearance"] + r for px, py in route):
                     continue
-                placed.append((slot, x, y))
+                placed.append((slot, x, y, *self._vertical_extent(ceiling, vertical, beam=False)))
                 break
             else:
                 free_slots.insert(0, slot)
@@ -388,8 +479,9 @@ def layout_capacity(cfg: dict) -> dict[str, int]:
     return {
         "rooms": rooms,
         "partitions": parts,
-        # per room: <= 6 pieces of its own walls (two doors split two sides), 2 per partition, the free walls
-        "segments": rooms * (6 + 2 * parts + max(level["free_walls"][1] for level in levels)),
+        # per room: <= 6 pieces of its own walls (two doors split two sides) + 2 above / below a window exit,
+        # <= 4 per partition (a window), the free walls
+        "segments": rooms * (8 + 4 * parts + max(level["free_walls"][1] for level in levels)),
         "pillars": rooms * max(level["pillars"][1] for level in levels),
         "waypoints": rooms * (parts + 1),
     }
@@ -398,23 +490,27 @@ def layout_capacity(cfg: dict) -> dict[str, int]:
 @dataclass
 class LayoutBatch:
     segments: torch.Tensor  # (B, S, 4) x0, y0, x1, y1
+    segment_z: torch.Tensor  # (B, S, 2) z_lo, z_hi
     segment_active: torch.Tensor  # (B, S) bool
     segment_free: torch.Tensor  # (B, S) bool, free-standing wall
     pillar_xy: torch.Tensor  # (B, P, 2), one row per radius slot
+    pillar_z: torch.Tensor  # (B, P, 2) z_lo, z_hi
     pillar_active: torch.Tensor  # (B, P) bool
     rooms: torch.Tensor  # (B, R, 4) x0, y0, x1, y1
+    ceilings: torch.Tensor  # (B, R)
     num_rooms: torch.Tensor  # (B,) long
-    partition_pt: torch.Tensor  # (B, R, Q, 2) gap centers
+    partition_pt: torch.Tensor  # (B, R, Q, 2) a point on each partition (its opening)
     partition_normal: torch.Tensor  # (B, R, Q, 2) toward the room exit
     partition_active: torch.Tensor  # (B, R, Q) bool
-    waypoints: torch.Tensor  # (B, WP, 2)
+    waypoints: torch.Tensor  # (B, WP, 3)
     remaining: torch.Tensor  # (B, WP) route length from each waypoint to the goal
     first_wp: torch.Tensor  # (B, R) long
     exit_wp: torch.Tensor  # (B, R) long
     exit_normal: torch.Tensor  # (B, R, 2)
     exit_width: torch.Tensor  # (B, R)
-    start: torch.Tensor  # (B, 2)
-    goal: torch.Tensor  # (B, 2)
+    exit_z: torch.Tensor  # (B, R, 2) height interval of the exit door's opening
+    start: torch.Tensor  # (B, 3)
+    goal: torch.Tensor  # (B, 3)
 
     def __getitem__(self, idx) -> "LayoutBatch":
         return LayoutBatch(**{f.name: getattr(self, f.name)[idx] for f in fields(self)})
@@ -428,33 +524,39 @@ class LayoutBatch:
         b, r_cap, q_cap, wp_cap = len(layouts), cap["rooms"], cap["partitions"], cap["waypoints"]
         a = {
             "segments": np.zeros((b, cap["segments"], 4), np.float32),
+            "segment_z": np.zeros((b, cap["segments"], 2), np.float32),
             "segment_active": np.zeros((b, cap["segments"]), bool),
             "segment_free": np.zeros((b, cap["segments"]), bool),
             "pillar_xy": np.zeros((b, cap["pillars"], 2), np.float32),
+            "pillar_z": np.zeros((b, cap["pillars"], 2), np.float32),
             "pillar_active": np.zeros((b, cap["pillars"]), bool),
             "rooms": np.zeros((b, r_cap, 4), np.float32),
+            "ceilings": np.zeros((b, r_cap), np.float32),
             "num_rooms": np.zeros(b, np.int64),
             "partition_pt": np.zeros((b, r_cap, q_cap, 2), np.float32),
             "partition_normal": np.zeros((b, r_cap, q_cap, 2), np.float32),
             "partition_active": np.zeros((b, r_cap, q_cap), bool),
-            "waypoints": np.zeros((b, wp_cap, 2), np.float32),
+            "waypoints": np.zeros((b, wp_cap, 3), np.float32),
             "remaining": np.zeros((b, wp_cap), np.float32),
             "first_wp": np.zeros((b, r_cap), np.int64),
             "exit_wp": np.zeros((b, r_cap), np.int64),
             "exit_normal": np.zeros((b, r_cap, 2), np.float32),
             "exit_width": np.zeros((b, r_cap), np.float32),
-            "start": np.zeros((b, 2), np.float32),
-            "goal": np.zeros((b, 2), np.float32),
+            "exit_z": np.zeros((b, r_cap, 2), np.float32),
+            "start": np.zeros((b, 3), np.float32),
+            "goal": np.zeros((b, 3), np.float32),
         }
         for i, lay in enumerate(layouts):
             n, ns, nw = len(lay.rooms), len(lay.segments), len(lay.waypoints)
-            a["segments"][i, :ns] = lay.segments
+            seg = np.asarray(lay.segments, np.float32)
+            a["segments"][i, :ns], a["segment_z"][i, :ns] = seg[:, :4], seg[:, 4:]
             a["segment_active"][i, :ns] = True
             a["segment_free"][i, :ns] = lay.free_standing
-            for slot, x, y in lay.pillars:
-                a["pillar_xy"][i, slot] = (x, y)
+            for slot, x, y, z_lo, z_hi in lay.pillars:
+                a["pillar_xy"][i, slot], a["pillar_z"][i, slot] = (x, y), (z_lo, z_hi)
                 a["pillar_active"][i, slot] = True
             a["rooms"][i, :n] = [(r.x0, r.y0, r.x1, r.y1) for r in lay.rooms]
+            a["ceilings"][i, :n] = lay.ceilings
             a["num_rooms"][i] = n
             for r, gaps in enumerate(lay.partitions):
                 for q, (gx, gy, nx, ny) in enumerate(gaps):
@@ -468,6 +570,7 @@ class LayoutBatch:
             a["exit_wp"][i, :n] = lay.exit_wp
             a["exit_normal"][i, :n] = lay.exit_normal
             a["exit_width"][i, :n] = lay.exit_width
+            a["exit_z"][i, :n] = lay.exit_z
             a["start"][i], a["goal"][i] = lay.start, lay.goal
         return LayoutBatch(**{k: torch.from_numpy(v).to(device) for k, v in a.items()})
 
@@ -484,26 +587,33 @@ class LayoutPool:
     """Pre-generated layouts on the GPU. Resets draw from the pool, so generation never runs per reset.
 
     The pool is regenerated when the curriculum level changes and after `pool_reuse` draws per layout on average,
-    so the policy keeps seeing fresh layouts.
+    so the policy keeps seeing fresh layouts. A `replay` share of each pool comes from a random easier level, so
+    what only easy layouts teach (e.g. braking for a goal in an empty room) is not forgotten at a level without them.
     """
 
     def __init__(self, cfg: dict, pillar_radii: list[float], device, seed: int = 0):
         self.cap = layout_capacity(cfg)
         self.size = cfg["rooms"]["pool_size"]
         self.reuse = cfg["rooms"]["pool_reuse"]
+        self.replay = cfg["curriculum"]["replay"]
         self.generator = LayoutGenerator(cfg, pillar_radii, seed)
         self.device = device
         self.level = None
         self.data = None
         self.draws = 0
 
-    def fill(self, level: dict) -> None:
-        self.data = LayoutBatch.pack([self.generator.sample(level) for _ in range(self.size)], self.cap, self.device)
+    def fill(self, level: dict, easier: list[dict]) -> None:
+        rng = self.generator.rng
+
+        def pick():
+            return rng.choice(easier) if easier and rng.random() < self.replay else level
+
+        self.data = LayoutBatch.pack([self.generator.sample(pick()) for _ in range(self.size)], self.cap, self.device)
         self.level = level
         self.draws = 0
 
-    def draw(self, n: int, level: dict) -> LayoutBatch:
+    def draw(self, n: int, level: dict, easier: list[dict]) -> LayoutBatch:
         if self.level is not level or self.draws >= self.size * self.reuse:
-            self.fill(level)
+            self.fill(level, easier)
         self.draws += n
         return self.data[torch.randint(0, self.size, (n,), device=self.device)]
